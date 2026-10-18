@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#F4F6F8</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="surfaceAlt">#EDF0F4</color>
+    <color name="text">#12161C</color>
+    <color name="textDim">#6B7685</color>
+    <color name="accent">#10B981</color>
+    <color name="accentInk">#FFFFFF</color>
+    <color name="divider">#E5E8EC</color>
+    <color name="danger">#DC2626</color>
+    <color name="warnBg">#FEF3C7</color>
+    <color name="warnText">#92400E</color>
+    <color name="ripple">#14000000</color>
+    <color name="scrim">#66000000</color>
+    <color name="ic_launcher_background">#0B0E13</color>
+</resources>
