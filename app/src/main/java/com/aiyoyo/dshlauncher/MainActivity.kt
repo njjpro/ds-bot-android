@@ -9,11 +9,13 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -51,6 +53,8 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -72,6 +76,8 @@ class MainActivity : Activity() {
         private const val KEY_CONSOLE = "last_console_error"
         private const val MAX_LIVE = 4
         private const val CHANNEL_ID = "dsh_events"
+        private const val REPO_RELEASES_API =
+            "https://api.github.com/repos/njjpro/ds-bot-android/releases/latest"
     }
 
     private lateinit var store: InstanceStore
@@ -99,6 +105,8 @@ class MainActivity : Activity() {
     private var foreground = false
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingMicRequest: PermissionRequest? = null
+    private var updateDownloadId: Long = -1L
+    private var downloadReceiver: BroadcastReceiver? = null
 
     private val currentInstance: Instance?
         get() = currentId?.let { instances[it] }
@@ -992,6 +1000,7 @@ class MainActivity : Activity() {
         popup.menu.add(0, 5, 4, "查看页面错误")
         popup.menu.add(0, 7, 5, "发送测试通知")
         popup.menu.add(0, 8, 6, "通知诊断")
+        popup.menu.add(0, 9, 7, "检查更新")
         val secure = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_SECURE, false)
         popup.menu.add(0, 4, 5, if (secure) "关闭防截屏" else "开启防截屏")
         popup.setOnMenuItemClickListener { item ->
@@ -1010,10 +1019,163 @@ class MainActivity : Activity() {
                     toast("已发送测试通知")
                 }
                 8 -> showNotifyDiagnostics()
+                9 -> checkForUpdate()
             }
             true
         }
         popup.show()
+    }
+
+    // --------------------------------------------------------------- 更新
+
+    private data class ReleaseInfo(val version: String, val notes: String, val apkUrl: String)
+
+    private fun checkForUpdate() {
+        toast("正在检查更新…")
+        Thread {
+            val result = runCatching { fetchLatestRelease() }
+            runOnUiThread {
+                result.onSuccess { release ->
+                    if (release == null) toast("已是最新版本")
+                    else showUpdateDialog(release)
+                }.onFailure {
+                    toast("检查更新失败：${it.message}")
+                }
+            }
+        }.start()
+    }
+
+    private fun fetchLatestRelease(): ReleaseInfo? {
+        val connection = URL(REPO_RELEASES_API).openConnection() as HttpURLConnection
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 15_000
+        connection.setRequestProperty("Accept", "application/vnd.github+json")
+        connection.setRequestProperty("User-Agent", "DS-Bot-Android")
+        val body = connection.inputStream.bufferedReader().use { it.readText() }
+        val json = org.json.JSONObject(body)
+        val tag = json.optString("tag_name").removePrefix("v").removePrefix("V")
+        if (tag.isBlank()) return null
+        val current = packageManager.getPackageInfo(packageName, 0).versionName ?: "0"
+        if (compareVersions(tag, current) <= 0) return null
+        val assets = json.optJSONArray("assets") ?: return null
+        var apkUrl: String? = null
+        for (i in 0 until assets.length()) {
+            val asset = assets.getJSONObject(i)
+            if (asset.optString("name").endsWith(".apk", ignoreCase = true)) {
+                apkUrl = asset.optString("browser_download_url")
+                break
+            }
+        }
+        if (apkUrl.isNullOrBlank()) return null
+        return ReleaseInfo(tag, json.optString("body"), apkUrl)
+    }
+
+    private fun compareVersions(a: String, b: String): Int {
+        fun parts(v: String) = v.split(".").map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+        val pa = parts(a)
+        val pb = parts(b)
+        for (i in 0 until maxOf(pa.size, pb.size)) {
+            val x = pa.getOrElse(i) { 0 }
+            val y = pb.getOrElse(i) { 0 }
+            if (x != y) return x.compareTo(y)
+        }
+        return 0
+    }
+
+    private fun showUpdateDialog(release: ReleaseInfo) {
+        val notes = release.notes.trim().ifBlank { "（该版本没有附更新说明）" }
+        AlertDialog.Builder(this)
+            .setTitle("发现新版本 ${release.version}")
+            .setMessage(notes.take(2000))
+            .setNegativeButton("稍后", null)
+            .setPositiveButton("下载并安装") { _, _ -> downloadUpdate(release) }
+            .show()
+    }
+
+    private fun downloadUpdate(release: ReleaseInfo) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            AlertDialog.Builder(this)
+                .setTitle("需要安装权限")
+                .setMessage("系统还没有允许 DS Bot 安装应用。请在设置里打开「安装未知应用」，然后回来重试。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("去设置") { _, _ ->
+                    runCatching {
+                        startActivity(
+                            Intent(
+                                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:$packageName")
+                            )
+                        )
+                    }
+                }
+                .show()
+            return
+        }
+        runCatching {
+            val request = DownloadManager.Request(Uri.parse(release.apkUrl))
+                .setTitle("DS Bot ${release.version}")
+                .setDescription("正在下载更新")
+                .setMimeType("application/vnd.android.package-archive")
+                .setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                )
+                .setDestinationInExternalFilesDir(
+                    this, Environment.DIRECTORY_DOWNLOADS, "ds-bot-${release.version}.apk"
+                )
+            val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            updateDownloadId = manager.enqueue(request)
+            registerDownloadReceiver()
+            toast("开始下载更新…")
+        }.onFailure { toast("无法开始下载：${it.message}") }
+    }
+
+    private fun registerDownloadReceiver() {
+        if (downloadReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                if (id != updateDownloadId) return
+                unregisterDownloadReceiver()
+                if (installDownloaded(id)) updateDownloadId = -1L
+            }
+        }
+        downloadReceiver = receiver
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
+    }
+
+    private fun unregisterDownloadReceiver() {
+        downloadReceiver?.let {
+            runCatching { unregisterReceiver(it) }
+        }
+        downloadReceiver = null
+    }
+
+    private fun installDownloaded(id: Long): Boolean {
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val uri = runCatching { manager.getUriForDownloadedFile(id) }.getOrNull()
+        if (uri == null) {
+            toast("更新包下载失败，请重试")
+            return false
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            startActivity(intent)
+            true
+        }.getOrElse {
+            toast("无法启动安装器：${it.message}")
+            false
+        }
     }
 
     private fun showNotifyDiagnostics() {
@@ -1267,6 +1429,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        unregisterDownloadReceiver()
         live.values.forEach { view ->
             view.stopLoading()
             view.destroy()
