@@ -71,9 +71,7 @@ class MainActivity : Activity() {
         private const val REQ_MIC = 1002
         private const val REQ_NOTIFY = 2001
         private const val PREFS = "dsh_launcher"
-        private const val PREF_SECURE = "flag_secure"
         private const val AUTH_MARKER = "dsh web authentication required"
-        private const val KEY_CONSOLE = "last_console_error"
         private const val MAX_LIVE = 4
         private const val CHANNEL_ID = "dsh_events"
         private const val REPO_RELEASES_API =
@@ -117,9 +115,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = InstanceStore(this)
-        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_SECURE, false)) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        }
         setContentView(buildRoot())
         reload()
         handleShare(intent)
@@ -863,20 +858,6 @@ class MainActivity : Activity() {
 
     private val chromeClient = object : WebChromeClient() {
 
-        override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
-            if (message.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
-                runCatching {
-                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                        .putString(
-                            KEY_CONSOLE,
-                            "[${message.sourceId()}:${message.lineNumber()}] ${message.message()}"
-                        )
-                        .commit()
-                }
-            }
-            return true
-        }
-
         override fun onProgressChanged(view: WebView, newProgress: Int) {
             if (view.tag != currentId) return
             progressBar.progress = newProgress
@@ -995,14 +976,9 @@ class MainActivity : Activity() {
         val instance = currentInstance ?: return
         val popup = PopupMenu(this, anchor)
         popup.menu.add(0, 6, 0, "在系统浏览器打开")
-        popup.menu.add(0, 2, 2, "编辑地址")
-        popup.menu.add(0, 3, 3, "复制地址")
-        popup.menu.add(0, 5, 4, "查看页面错误")
-        popup.menu.add(0, 7, 5, "发送测试通知")
-        popup.menu.add(0, 8, 6, "通知诊断")
-        popup.menu.add(0, 9, 7, "检查更新")
-        val secure = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_SECURE, false)
-        popup.menu.add(0, 4, 5, if (secure) "关闭防截屏" else "开启防截屏")
+        popup.menu.add(0, 2, 1, "编辑地址")
+        popup.menu.add(0, 3, 2, "复制地址")
+        popup.menu.add(0, 9, 3, "检查更新")
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 6 -> openExternal(Uri.parse(instance.url))
@@ -1012,13 +988,6 @@ class MainActivity : Activity() {
                     clipboard.setPrimaryClip(ClipData.newPlainText("DSH 地址", instance.url))
                     toast("地址已复制（含 token，注意别外传）")
                 }
-                4 -> toggleSecure(!secure)
-                5 -> showConsoleError()
-                7 -> {
-                    currentId?.let { postNotification(it, "done", "这是一条测试通知") }
-                    toast("已发送测试通知")
-                }
-                8 -> showNotifyDiagnostics()
                 9 -> checkForUpdate()
             }
             true
@@ -1178,67 +1147,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showNotifyDiagnostics() {
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val permission = if (Build.VERSION.SDK_INT < 33) {
-            "系统版本低于 13，无需运行时权限"
-        } else if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        ) "已授予" else "未授予（通知会被系统丢弃）"
-        val channel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            if (manager.getNotificationChannel(CHANNEL_ID) == null) "未创建" else "已创建"
-        } else "不需要"
-        val events = prefs.getString("notify_debug", null)
-            ?: "（还没有收到页面的任何事件）"
-        val text = buildString {
-            append("通知权限：").append(permission).append("\n")
-            append("通知通道：").append(channel).append("\n")
-            append("App 在前台：").append(if (foreground) "是" else "否").append("\n")
-            append("当前页面：").append(currentInstance?.name ?: "无").append("\n\n")
-            append("最近事件：\n").append(events)
-        }
-        AlertDialog.Builder(this)
-            .setTitle("通知诊断")
-            .setMessage(text)
-            .setNegativeButton("关闭", null)
-            .setPositiveButton("复制") { _, _ ->
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("通知诊断", text))
-                toast("已复制")
-            }
-            .setNeutralButton("清空记录") { _, _ ->
-                prefs.edit().remove("notify_debug").apply()
-            }
-            .show()
-    }
-
-    private fun showConsoleError() {
-        val error = getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getString(KEY_CONSOLE, null)
-        if (error.isNullOrBlank()) {
-            toast("没有记录到页面错误")
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("最近的页面错误")
-            .setMessage(error)
-            .setNegativeButton("关闭", null)
-            .setPositiveButton("复制") { _, _ ->
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("页面错误", error))
-                toast("已复制")
-            }
-            .show()
-    }
-
-    private fun toggleSecure(enabled: Boolean) {
-        if (enabled) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_SECURE, enabled).apply()
-        toast(if (enabled) "已开启防截屏（最近任务里会隐藏内容）" else "已关闭防截屏")
-    }
-
     private fun editUrlDialog() {
         val instance = currentInstance ?: return
         EditorDialog(this, instance, null) { name, url ->
@@ -1261,13 +1169,6 @@ class MainActivity : Activity() {
             PackageManager.PERMISSION_GRANTED
         ) return
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFY)
-    }
-
-    private fun recordEvent(label: String) {
-        val stamp = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val old = prefs.getString("notify_debug", null)?.lines()?.take(11) ?: emptyList()
-        prefs.edit().putString("notify_debug", (listOf("$stamp $label") + old).joinToString("\n")).apply()
     }
 
     private fun ensureChannel() {
@@ -1367,19 +1268,9 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun notify(kind: String, text: String) {
             runOnUiThread {
-                recordEvent("hook:$kind")
-                if (foreground && inWorkspace && currentId == instanceId) {
-                    recordEvent("skipped:visible")
-                    return@runOnUiThread
-                }
+                if (foreground && inWorkspace && currentId == instanceId) return@runOnUiThread
                 postNotification(instanceId, kind, text)
-                recordEvent("posted:$kind")
             }
-        }
-
-        @JavascriptInterface
-        fun event(label: String) {
-            runOnUiThread { recordEvent(label) }
         }
     }
 
@@ -1462,7 +1353,6 @@ class MainActivity : Activity() {
         (function () {
           if (window.__dshNotifyHooked) return;
           window.__dshNotifyHooked = true;
-          if (window.DshBridge && DshBridge.event) DshBridge.event('hooked');
           var lastBusy = false;
           var lastQuestion = null;
           function isBusy() {
@@ -1480,7 +1370,6 @@ class MainActivity : Activity() {
           function tick() {
             try {
               var busy = isBusy();
-              if (busy !== lastBusy && DshBridge.event) DshBridge.event('busy:' + (busy ? '1' : '0'));
               if (lastBusy && !busy) DshBridge.notify('done', '任务已完成');
               lastBusy = busy;
               var key = questionKey();
